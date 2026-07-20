@@ -1,0 +1,135 @@
+name: homeassisstant
+services:
+    homeassistant:
+        cpu_shares: 90
+        command: []
+        container_name: homeassistant
+        deploy:
+            resources:
+                limits:
+                    memory: "7459569664"
+        hostname: homeassistant
+        image: ghcr.io/home-assistant/home-assistant:stable
+        labels:
+            icon: https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/svg/home-assistant.svg
+        network_mode: host
+        privileged: true
+        restart: unless-stopped
+        volumes:
+            - type: bind
+              source: /DATA/AppData/homeassistant
+              target: /config
+              bind:
+                create_host_path: true
+            - type: bind
+              source: /etc/localtime
+              target: /etc/localtime
+              read_only: true
+              bind:
+                create_host_path: true
+            - type: bind
+              source: /run/dbus
+              target: /run/dbus
+              read_only: true
+              bind:
+                create_host_path: true
+    openwakeword:
+        cpu_shares: 90
+        command:
+            - --preload-model
+            - hey_nabu
+        container_name: openwakeword
+        deploy:
+            resources:
+                limits:
+                    memory: "7459569664"
+        hostname: openwakeword
+        image: rhasspy/wyoming-openwakeword:latest
+        labels:
+            icon: https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/svg/home-assistant.svg
+        networks:
+            default: null
+        ports:
+            - mode: ingress
+              target: 10400
+              published: "10400"
+              protocol: tcp
+        restart: unless-stopped
+        volumes:
+            - type: bind
+              source: /DATA/AppData/openwakeword
+              target: /data
+              bind:
+                create_host_path: true
+    piper:
+        cpu_shares: 90
+        command:
+            - --voice
+            - en_US-lessac-medium
+        container_name: piper
+        deploy:
+            resources:
+                limits:
+                    memory: "7459569664"
+        hostname: piper
+        image: rhasspy/wyoming-piper:latest
+        labels:
+            icon: https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/svg/home-assistant.svg
+        networks:
+            default: null
+        ports:
+            - mode: ingress
+              target: 10200
+              published: "10200"
+              protocol: tcp
+        restart: unless-stopped
+        volumes:
+            - type: bind
+              source: /DATA/AppData/piper
+              target: /data
+              bind:
+                create_host_path: true
+    whisper:
+        cpu_shares: 90
+        command:
+            - --model
+            - base
+            - --language
+            - en
+        container_name: whisper
+        deploy:
+            resources:
+                limits:
+                    memory: "7459569664"
+        hostname: whisper
+        image: rhasspy/wyoming-whisper:latest
+        labels:
+            icon: https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/svg/home-assistant.svg
+        networks:
+            default: null
+        ports:
+            - mode: ingress
+              target: 10300
+              published: "10300"
+              protocol: tcp
+        restart: unless-stopped
+        volumes:
+            - type: bind
+              source: /DATA/AppData/whisper
+              target: /data
+              bind:
+                create_host_path: true
+networks:
+    default:
+        name: homeassisstant_default
+x-casaos:
+    author: self
+    category: self
+    hostname: ""
+    icon: https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/svg/home-assistant.svg
+    index: /home/overview
+    is_uncontrolled: false
+    port_map: "8123"
+    scheme: http
+    title:
+        custom: Home Assistant
