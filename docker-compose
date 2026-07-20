@@ -1,0 +1,689 @@
+# Tom Spark's ARR Stack — Automated Media Server
+# https://github.com/loponai/arrstack
+#
+# Usage:
+#   1. Copy .env.example to .env and fill in your VPN credentials
+#   2. Run: bash setup-folders.sh
+#   3. Run: docker compose up -d
+#
+# All VPN-protected services (qBittorrent, Prowlarr, FlareSolverr) run
+# through Gluetun. If the VPN drops, traffic stops. Zero leaks.
+#
+# Radarr, Sonarr, Lidarr, Bazarr, Jellyfin, and Seerr do NOT run through
+# the VPN — they need direct network access for speed and local connectivity.
+
+networks:
+  arrnetwork:
+    name: arrnetwork
+    ipam:
+      config:
+        - subnet: 172.39.0.0/24
+
+services:
+
+  # ============================================================
+  # GLUETUN — VPN Container (kill switch + tunnel)
+  # All VPN-protected services route through this container.
+  # Ports for those services are mapped HERE, not on the services themselves.
+  # Docs: https://github.com/qdm12/gluetun-wiki
+  # ============================================================
+  gluetun:
+    image: qmcgaw/gluetun:latest
+    container_name: gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    networks:
+      arrnetwork:
+        ipv4_address: ${IP_GLUETUN}
+    ports:
+      - 8080:8080     # qBittorrent WebUI
+      - 6881:6881     # qBittorrent torrenting port
+      - 6881:6881/udp
+      - 9696:9696     # Prowlarr
+      - 8191:8191     # FlareSolverr
+    volumes:
+      - ./gluetun:/gluetun
+    environment:
+      - VPN_SERVICE_PROVIDER=${VPN_SERVICE_PROVIDER}
+      - VPN_TYPE=${VPN_TYPE}
+      # --- WireGuard credentials (most providers) ---
+      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
+      - WIREGUARD_ADDRESSES=${WIREGUARD_ADDRESSES}
+      - WIREGUARD_PUBLIC_KEY=${WIREGUARD_PUBLIC_KEY}
+      - WIREGUARD_PRESHARED_KEY=${WIREGUARD_PRESHARED_KEY}
+      # --- OpenVPN credentials (if using OpenVPN instead) ---
+      - OPENVPN_USER=${OPENVPN_USER}
+      - OPENVPN_PASSWORD=${OPENVPN_PASSWORD}
+      # --- Server selection ---
+      - SERVER_COUNTRIES=${SERVER_COUNTRIES}
+      # --- Port forwarding (ProtonVPN, AirVPN, PIA) ---
+      - VPN_PORT_FORWARDING=${VPN_PORT_FORWARDING}
+      - FIREWALL_VPN_INPUT_PORTS=${FIREWALL_VPN_INPUT_PORTS}
+      # --- General ---
+      - TZ=${TZ}
+    healthcheck:
+      test: wget -qO /dev/null http://127.0.0.1:9999 || exit 1
+      interval: 20s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # ============================================================
+  # QBITTORRENT — Torrent Client (runs through Gluetun VPN)
+  # ALL traffic goes through the VPN tunnel. No direct internet.
+  # ============================================================
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:5.2.0
+    container_name: qbittorrent
+    network_mode: service:gluetun
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: true
+    labels:
+      - deunhealth.restart.on.unhealthy=true
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - UMASK=002
+      - TZ=${TZ}
+      - WEBUI_PORT=8080
+      - TORRENTING_PORT=${FIREWALL_VPN_INPUT_PORTS}
+    volumes:
+      - ./qbittorrent:/config
+      - /data:/data
+    healthcheck:
+      test: wget -q --spider http://localhost:8080 || exit 1
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  # ============================================================
+  # DEUNHEALTH — Auto-restarts unhealthy containers
+  # If qBittorrent loses VPN connection, this restarts it automatically.
+  # ============================================================
+  deunhealth:
+    image: qmcgaw/deunhealth
+    container_name: deunhealth
+    network_mode: none
+    environment:
+      - LOG_LEVEL=info
+      - HEALTH_SERVER_ADDRESS=127.0.0.1:9999
+      - TZ=${TZ}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: always
+
+  # ============================================================
+  # PROWLARR — Indexer Manager (runs through Gluetun VPN)
+  # Manages torrent/usenet indexers. Syncs to Radarr/Sonarr/Lidarr.
+  # ============================================================
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    network_mode: service:gluetun
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: true
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - UMASK=002
+      - TZ=${TZ}
+    volumes:
+      - ./prowlarr:/config
+    restart: unless-stopped
+
+  # ============================================================
+  # FLARESOLVERR — Cloudflare Bypass (runs through Gluetun VPN)
+  # Some indexers use Cloudflare protection. This gets around it.
+  # ============================================================
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    network_mode: service:gluetun
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: true
+    environment:
+      - LOG_LEVEL=info
+      - TZ=${TZ}
+    restart: unless-stopped
+
+  # ============================================================
+  # RADARR — Movie Manager (NOT behind VPN)
+  # Searches via Prowlarr, sends downloads to qBittorrent,
+  # renames and hard-links completed files to media folder.
+  # ============================================================
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - UMASK=002
+      - TZ=${TZ}
+    volumes:
+      - ./radarr:/config
+      - /data:/data
+    ports:
+      - 7878:7878
+    networks:
+      arrnetwork:
+        ipv4_address: ${IP_RADARR}
+    restart: unless-stopped
+
+  # ============================================================
+  # SONARR — TV Show Manager (NOT behind VPN)
+  # Same pattern as Radarr but for TV series.
+  # ============================================================
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - UMASK=002
+      - TZ=${TZ}
+    volumes:
+      - ./sonarr:/config
+      - /data:/data
+    ports:
+      - 8989:8989
+    networks:
+      arrnetwork:
+        ipv4_address: ${IP_SONARR}
+    restart: unless-stopped
+
+  # ============================================================
+  # LIDARR — Music Manager (NOT behind VPN)
+  # Optional. Comment out if you don't need music automation.
+  # ============================================================
+  lidarr:
+    image: lscr.io/linuxserver/lidarr:latest
+    container_name: lidarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - UMASK=002
+      - TZ=${TZ}
+    volumes:
+      - ./lidarr:/config
+      - /data:/data
+    ports:
+      - 8686:8686
+    networks:
+      arrnetwork:
+        ipv4_address: ${IP_LIDARR}
+    restart: unless-stopped
+
+  # ============================================================
+  # BAZARR — Subtitle Manager (NOT behind VPN)
+  # Automatically downloads subtitles for movies and TV shows.
+  # ============================================================
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - UMASK=002
+      - TZ=${TZ}
+    volumes:
+      - ./bazarr:/config
+      - /data:/data
+    ports:
+      - 6767:6767
+    networks:
+      arrnetwork:
+        ipv4_address: ${IP_BAZARR}
+    restart: unless-stopped
+
+  # ============================================================
+  # NAVIDROME — Music Streaming Server (NOT behind VPN)
+  # Self-hosted Spotify. Streams your music library.
+  # ============================================================
+  navidrome:
+    image: deluan/navidrome:0.61.2
+    container_name: navidrome
+    user: ${PUID}:${PGID}
+    environment:
+      - TZ=${TZ}
+      - ND_LOGLEVEL=info
+      - ND_SCANINTERVAL=1m
+      - ND_SESSIONTIMEOUT=24h
+      - ND_SUBSONIC_DEFAULTREPORTREALPATH=true
+    volumes:
+      - ./navidrome:/data
+      - /data/media/music:/music:ro
+    ports:
+      - 4533:4533
+    networks:
+      arrnetwork:
+        ipv4_address: ${IP_NAVIDROME}
+    restart: unless-stopped
+
+  # ========================================================== #
+  #                     Docker Monitoring                      #
+  # ========================================================== #
+  # ============================================================
+  # PORTAINER — Docker Management UI
+  # Manage containers, images, volumes via web UI.
+  # ============================================================
+  portainer:
+    image: portainer/portainer-ce:2.39.3
+    container_name: portainer
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./portainer:/data
+    ports:
+      - 9443:9443
+      - 9000:9000
+    networks:
+      arrnetwork:
+        ipv4_address: ${IP_PORTAINER}
+    restart: unless-stopped
+
+  # ============================================================
+  # DOZZLE — Real-time Docker Log Viewer
+  # Stream live logs from all containers in the browser.
+  # ============================================================
+  dozzle:
+    image: amir20/dozzle:v10.6.5
+    container_name: dozzle
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./dozzle:/data
+    ports:
+      - 9999:8080
+    networks:
+      arrnetwork:
+        ipv4_address: ${IP_DOZZLE}
+    restart: unless-stopped
+
+  # ============================================================
+  # BESZEL — Lightweight Server Monitoring
+  # CPU, memory, disk, network, Docker container stats.
+  # ============================================================
+  beszel:
+    image: henrygd/beszel:0.18.7
+    container_name: beszel
+    ports:
+      - 8090:8090
+    volumes:
+      - ./beszel/data:/beszel_data
+      - ./beszel/socket:/beszel_socket
+    environment:
+      - APP_URL=http://localhost:8090
+    networks:
+      arrnetwork:
+        ipv4_address: ${IP_BESZEL}
+    restart: unless-stopped
+
+  beszel-agent:
+    image: henrygd/beszel-agent
+    container_name: beszel-agent
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./beszel_agent_data:/var/lib/beszel-agent
+      # monitor other disks / partitions by mounting a folder in /extra-filesystems
+      # - /mnt/disk/.beszel:/extra-filesystems/sda1:ro
+    environment:
+      LISTEN: 45876
+      KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHomBdysnist0tqLW/C3TcHC5WMojiOSHGQ0owT7o4LE
+      TOKEN: 1d-179d4dc71cae-4fc-24f1701b034
+      HUB_URL: http://localhost:8090
+
+  # ============================================================
+  # NICOTINE+ — Soulseek Client (NOT behind VPN)
+  # Peer-to-peer music sharing. Huge library, completely free.
+  # Access via browser at port 6080.
+  # ============================================================
+  nicotine:
+    image: ghcr.io/fletchto99/nicotine-plus-docker:3.3.10
+    container_name: nicotine
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - UMASK=002
+      - SELKIES_ENABLE_HTTPS=false
+    volumes:
+      - ./nicotine:/config
+      - /data/media/music:/downloads
+      - /data/media/music/incomplete:/data/incomplete_downloads
+    ports:
+      - 6080:6080
+      - 6081:6081
+    shm_size: "1gb"
+    networks:
+      arrnetwork:
+        ipv4_address: ${IP_NICOTINE}
+    restart: unless-stopped
+
+  # ============================================================
+  # JELLYFIN — Media Server (NOT behind VPN)
+  # Your personal streaming service. Plays movies, TV, music.
+  # Needs full bandwidth — never put this behind the VPN.
+  # ============================================================
+  jellyfin:
+    image: lscr.io/linuxserver/jellyfin:latest
+    container_name: jellyfin
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - UMASK=002
+      - TZ=${TZ}
+    volumes:
+      - ./jellyfin:/config
+      - /data/media:/data/media
+    ports:
+      - 8096:8096
+    # Uncomment the lines below to enable hardware transcoding (Intel Quick Sync / VAAPI).
+    # Only works if your system has Intel/AMD integrated graphics (/dev/dri must exist).
+    # If you get an error about /dev/dri not found, leave these commented out.
+    # devices:
+    #   - /dev/dri:/dev/dri
+    networks:
+      arrnetwork:
+        ipv4_address: ${IP_JELLYFIN}
+    restart: unless-stopped
+
+  # ============================================================
+  # SEERR — Request System (NOT behind VPN)
+  # Netflix-like UI for requesting movies and TV shows.
+  # Share this with family — they never need to touch Radarr.
+  #
+  # Seerr is the unified successor to Overseerr and Jellyseerr
+  # (merged under seerr-team). Supports Plex, Jellyfin, and Emby.
+  #
+  # Config uses a NAMED Docker volume (not a bind mount). This is
+  # required: Seerr runs as the `node` user (UID 1000) and a
+  # bind-mounted host folder is created root-owned, causing a
+  # permission-denied crash loop. On Windows/WSL, bind mounts also
+  # corrupt the SQLite DB over SMB. Named volumes fix both cases
+  # (matches upstream Seerr docs).
+  #
+  # Migrating from ./jellyseerr or ./seerr bind mount? See README
+  # troubleshooting "Migrating Seerr config to a named volume".
+  # ============================================================
+  seerr:
+    image: ghcr.io/seerr-team/seerr:latest
+    init: true
+    container_name: seerr
+    environment:
+      - LOG_LEVEL=info
+      - TZ=${TZ}
+      - PORT=5055
+    volumes:
+      - seerr_config:/app/config
+    ports:
+      - 5055:5055
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:5055/api/v1/settings/public || exit 1
+      start_period: 20s
+      timeout: 3s
+      interval: 15s
+      retries: 3
+    networks:
+      arrnetwork:
+        ipv4_address: ${IP_SEERR}
+    restart: unless-stopped
+  
+  # ==========================================================================
+  # Mealie - self hosted recipe manager, meal planner and shopping list.
+  # Easily add recipes into your database by providing the URL and Mealie will
+  # automatically import the relevant data, or add a family recipe with the
+  # UI editor.
+  # ==========================================================================
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_ROOT_PASSWORD}
+      - POSTGRES_DB=postgres
+    volumes:
+      - /data/postgres-shared:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d
+    networks:
+      arrnetwork:
+        ipv4_address: 172.39.0.60
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mealie:
+    image: ghcr.io/mealie-recipes/mealie:latest
+    container_name: mealie
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - ALLOW_SIGNUP=false
+      - BASE_URL=https://mealie.yourdomain.com
+      - DB_ENGINE=postgres
+      - POSTGRES_USER=mealie
+      - POSTGRES_PASSWORD=${MEALIE_POSTGRES_PASSWORD}
+      - POSTGRES_SERVER=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=mealie
+    volumes:
+      - ./mealie:/app/data
+    ports:
+      - 9925:9000
+    networks:
+      arrnetwork:
+        ipv4_address: 172.39.0.61
+    restart: unless-stopped
+
+  # ==========================================================================
+  # Immich - arr-stack integration snippet
+  # ==========================================================================
+  immich-redis:
+    container_name: immich-redis
+    image: docker.io/valkey/valkey:9@sha256:3eeb09785cd61ec8e3be35f8804c8892080f3ca21934d628abc24ee4ed1698f6
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping || exit 1"]
+    networks:
+      arrnetwork:
+        ipv4_address: 172.39.0.70
+    restart: unless-stopped
+
+  immich-postgres:
+    container_name: immich-postgres
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0@sha256:bcf63357191b76a916ae5eb93464d65c07511da41e3bf7a8416db519b40b1c23
+    environment:
+      - POSTGRES_DB=immich
+      - POSTGRES_INITDB_ARGS=--data-checksums
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_USER=postgres
+    volumes:
+      - /DATA/AppData/immich/pgdata:/var/lib/postgresql/data
+    networks:
+      arrnetwork:
+        ipv4_address: 172.39.0.71
+    restart: unless-stopped
+
+  immich-machine-learning:
+    container_name: immich-machine-learning
+    image: ghcr.io/immich-app/immich-machine-learning:v3.0.1
+    runtime: nvidia
+    environment:
+      - DB_DATABASE_NAME=immich
+      - DB_PASSWORD=postgres
+      - DB_USERNAME=postgres
+      - DB_HOSTNAME=immich-postgres
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - /DATA/AppData/immich/model-cache:/cache
+    networks:
+      arrnetwork:
+        ipv4_address: 172.39.0.72
+    restart: unless-stopped
+
+  immich-server:
+    container_name: immich-server
+    image: ghcr.io/immich-app/immich-server:v3.0.1
+    depends_on:
+      - immich-postgres
+      - immich-redis
+    environment:
+      - DB_DATABASE_NAME=immich
+      - DB_PASSWORD=postgres
+      - DB_USERNAME=postgres
+      - DB_HOSTNAME=immich-postgres
+      - REDIS_HOSTNAME=immich-redis
+    volumes:
+      - /DATA/Gallery/immich:/usr/src/app/upload
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - 2283:2283
+    networks:
+      arrnetwork:
+        ipv4_address: 172.39.0.73
+    restart: unless-stopped
+
+  # ==========================================================================
+  # heerr — arr-stack integration snippet
+  # ==========================================================================
+  # These services append to your existing arr-stack docker-compose.yml
+  # (~/docker/arr-stack/docker-compose.yml). Copy the four services below +
+  # the `networks:` block into the arr-stack file, copy `.env.example` to
+  # `.env` next to the merged compose file, fill in real values, and run:
+  #   docker compose up -d heerr-postgres-init heerr-postgres heerr-migrate heerr-backend
+  #
+  # Connectivity: Tailscale-only — no host port publication. The arr-stack
+  # subnet (172.39.0.0/24) is expected to be Tailscale-routable from the
+  # tailnet via the host's tailscaled.
+  # ==========================================================================
+  # One-shot: chown the bind-mount dir to the Postgres image's UID (999) so
+  # the postgres container can write its data files. Required because the
+  # bind mount is created with root ownership on first compose up.
+  heerr-postgres-init:
+    image: alpine:3.20
+    container_name: heerr-postgres-init
+    command:
+      - sh
+      - -c
+      - "mkdir -p /data/postgres && chown -R 999:999 /data/postgres"
+    volumes:
+      - /data/postgres:/data/postgres
+    restart: "no"
+
+  heerr-postgres:
+    image: pgvector/pgvector:pg17
+    container_name: heerr-postgres
+    env_file:
+      - .env
+    environment:
+      PGDATA: /data/postgres
+    volumes:
+      - /data/postgres:/data/postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+    depends_on:
+      heerr-postgres-init:
+        condition: service_completed_successfully
+    networks:
+      arrnetwork:
+        ipv4_address: 172.39.0.50
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # One-shot: applies Alembic migrations. Exits 0 on success. backend waits
+  # on this service_completed_successfully so the DB schema is ready when
+  # uvicorn starts.
+  heerr-migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: aashish010/heerr-backend:latest
+    container_name: heerr-migrate
+    env_file:
+      - .env
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      heerr-postgres:
+        condition: service_healthy
+    networks:
+      - arrnetwork
+    restart: "no"
+
+  heerr-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: aashish010/heerr-backend:latest
+    container_name: heerr-backend
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      # Navidrome watches the host path and indexes new files within ~1 min.
+      - /data/media/music:/data/media/music:rw
+    healthcheck:
+      # Python urllib is in the slim image; avoids adding curl just for this.
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health',timeout=2); sys.exit(0 if r.status==200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      heerr-migrate:
+        condition: service_completed_successfully
+    networks:
+      arrnetwork:
+        ipv4_address: 172.39.0.51
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+  # ============================================================
+  # UPTIME KUMA — Uptime/Status Monitoring
+  # ============================================================
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: uptime-kuma
+    volumes:
+      - ./uptime-kuma:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - 3004:3001
+    networks:
+      arrnetwork:
+        ipv4_address: ${IP_KUMA}
+    restart: unless-stopped
+
+volumes:
+  seerr_config:
