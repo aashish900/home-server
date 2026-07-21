@@ -633,6 +633,26 @@ services:
       - arrnetwork
     restart: "no"
 
+  # One-shot: chown the podcast-episode bind-mount dir to the backend
+  # image's non-root user (UID/GID 1000, see backend/Dockerfile) so
+  # heerr-backend can write downloaded episodes. Required for the same
+  # reason as heerr-postgres-init above — the bind mount is created with
+  # root ownership on first `docker compose up`, and (unlike
+  # /data/media/music, whose ownership predates this backend and is
+  # managed by the existing arr-stack/Navidrome setup) nothing else on the
+  # host ever chowns this newer path. Missing this step is the root cause
+  # of "Permission denied" writing to /data/media/podcasts (#53).
+  heerr-podcasts-init:
+    image: alpine:3.20
+    container_name: heerr-podcasts-init
+    command:
+      - sh
+      - -c
+      - "mkdir -p /data/media/podcasts && chown -R 1000:1000 /data/media/podcasts"
+    volumes:
+      - /data/media/podcasts:/data/media/podcasts
+    restart: "no"
+
   heerr-backend:
     build:
       context: ./backend
@@ -659,6 +679,8 @@ services:
       start_period: 15s
     depends_on:
       heerr-migrate:
+        condition: service_completed_successfully
+      heerr-podcasts-init:
         condition: service_completed_successfully
     networks:
       arrnetwork:
